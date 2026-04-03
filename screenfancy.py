@@ -6,6 +6,7 @@
 # http://www.opensource.org/licenses/mit-license.php
 
 import sys
+import re
 import codecs
 from optparse import OptionParser
 from reportlab import platypus
@@ -166,13 +167,43 @@ def to_pdf(
             # Ignore unknown types
             pass
 
+    meta = pdf_metadata(screenplay)
     doc = template_constructor(
         output_filename,
         pagesize=(settings.page_width, settings.page_height),
         settings=settings,
-        has_title_page=has_title_page
+        has_title_page=has_title_page,
+        **meta,
     )
     doc.build(story)
+
+
+def pdf_metadata(screenplay):
+    title_lines = screenplay.get_rich_attribute("Title")
+    author_lines = [
+        *screenplay.get_rich_attribute("Author"),
+        *screenplay.get_rich_attribute("Authors"),
+    ]
+    subject_lines = screenplay.get_rich_attribute("Subject")
+    keywords_lines = screenplay.get_rich_attribute("Keywords")
+
+    lang_lines = [
+        *screenplay.get_rich_attribute("Lang"),
+        *screenplay.get_rich_attribute("Language"),
+    ]
+
+    return {
+        "title":   ' '.join([str(line) for line in title_lines]) or None,
+        "subject": ' '.join([str(line) for line in subject_lines]) or None,
+        "author": ', '.join([str(line) for line in author_lines]) or None,
+        "keywords": [
+            word.strip()
+            for line in keywords_lines
+            for word in re.split('[,;/]', str(line))
+            if word.strip()
+        ],
+        "lang":    ' '.join([str(line) for line in lang_lines]) or None,
+    }
 
 
 def main(args):
