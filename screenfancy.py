@@ -99,7 +99,8 @@ def add_character_stats(story, screenplay, style):
         for character, stat in stats.items()
         if character is not None
     ]
-    stat_lines.sort(key=lambda x: x[2], reverse=True)
+    # Sort by speaking duration
+    stat_lines.sort(key=lambda x: x[3], reverse=True)
 
     cells = [
         [f"{character}:", f"{takes} takes,", f"{scenes} scenes,", pretty_time(time_estimate)]
