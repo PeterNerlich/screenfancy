@@ -125,7 +125,7 @@ def add_character_stats(story, screenplay, style):
     ]
     story.append(platypus.Preformatted('\n'.join(lines), style.default_style))
 
-    #story.append(platypus.PageBreak())
+    story.append(platypus.PageBreak())
 
 
 def pretty_time(delta):
