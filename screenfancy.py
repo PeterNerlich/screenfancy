@@ -12,6 +12,8 @@ from optparse import OptionParser
 from reportlab import platypus
 from datetime import timedelta
 from pprint import pp
+from copy import deepcopy
+from itertools import zip_longest
 
 from screenplain import types
 from screenplain.parsers import fountain
@@ -22,45 +24,66 @@ from screenplain.types import (
 )
 
 
-def compile_character_stats(screenplay):
-    characters = {}
-    characters[None] = {
+def compile_stats(screenplay):
+    template = {
         "takes": 0,
-        "scenes": set(),
         "words": 0,
         "chars": 0,
         "time": timedelta(),
     }
-    total = characters[None]
+    template_characters = {
+        **template,
+        "scenes": set(),
+    }
+    template_scenes = {
+        **template,
+        "characters": set(),
+    }
+
+    characters = {}
+    characters[None] = total_characters = deepcopy(template_characters)
+
+    scenes = {}
+    scenes[None] = total_scenes = deepcopy(template_scenes)
 
     current_scene = None
     current_character = None
 
     def add_dialog(para):
         current_character = str(para.character).removesuffix(" (CONT'D)")
+
         if current_character not in characters:
-            characters[current_character] = {
-                "takes": 0,
-                "scenes": set(),
-                "words": 0,
-                "chars": 0,
-                "time": timedelta(),
-            }
+            characters[current_character] = deepcopy(template_characters)
         c = characters[current_character]
+
+        if current_scene not in scenes:
+            scenes[current_scene] = deepcopy(template_scenes)
+        s = scenes[current_scene]
 
         c["takes"] += 1
         c["scenes"].add(current_scene)
 
+        s["takes"] += 1
+        s["characters"].add(current_character)
+
         for parenthetical, line in para.blocks:
             if not parenthetical:
-                c["chars"] += len(str(line))
+                chars = len(str(line))
+                c["chars"] += chars
+                s["chars"] += chars
                 words = str(line).split()
                 c["words"] += len(words)
+                s["words"] += len(words)
         
-        total["takes"] += 1
-        total["scenes"].add(current_scene)
-        total["words"] += c["words"]
-        total["chars"] += c["chars"]
+        total_characters["takes"] += 1
+        total_characters["scenes"].add(current_scene)
+        total_characters["words"] += c["words"]
+        total_characters["chars"] += c["chars"]
+
+        total_scenes["takes"] += 1
+        total_scenes["characters"].add(current_character)
+        total_scenes["words"] += s["words"]
+        total_scenes["chars"] += s["chars"]
 
     for para in screenplay:
         if isinstance(para, Dialog):
@@ -83,12 +106,24 @@ def compile_character_stats(screenplay):
               + c["words"] * .2
               + c["chars"] * .025
             ))
-            total["time"] += c["time"]
+            total_characters["time"] += c["time"]
 
-    return characters
+    for scene, s in scenes.items():
+        if scene is not None:
+            s["time"] += timedelta(seconds = (
+                s["takes"] * 1
+              + s["words"] * .2
+              + s["chars"] * .025
+            ))
+            total_scenes["time"] += s["time"]
 
-def add_character_stats(story, screenplay, style):
-    characters = compile_character_stats(screenplay)
+    return {
+        "characters": characters,
+        "scenes": scenes,
+    }
+
+def add_character_stats(story, stat_dict, style):
+    characters = stat_dict["characters"]
     pp(characters)
     stats = {
         character: [character, len(stats["scenes"]), stats["takes"], stats["time"]]
@@ -115,6 +150,9 @@ def add_character_stats(story, screenplay, style):
         for column in zip(*cells)
     ]
     lines = [
+        "Characters:",
+        "",
+    ] + [
         ' '.join([
             f"{cell}{' '*padding}"
             for cell, padding in zip(row, paddings)
@@ -129,6 +167,68 @@ def add_character_stats(story, screenplay, style):
 
     story.append(platypus.PageBreak())
 
+def add_scene_stats(story, stat_dict, style):
+    scenes = stat_dict["scenes"]
+    pp(scenes)
+    stats = {
+        scene: [scene, stats["characters"], stats["takes"], stats["time"]]
+        for scene, stats in scenes.items()
+    }
+    stat_lines = [
+        stat
+        for scene, stat in stats.items()
+        if scene is not None
+    ]
+    # Sort by speaking duration
+    stat_lines.sort(key=lambda x: x[3], reverse=True)
+
+    # Prepare per scene character list
+    character_sets = [
+        scenes[scene]["characters"]
+        for line in stat_lines
+        if (scene := line[0])
+    ]
+
+    cells = [
+        [f"{scene}:", f"{takes} takes,", f"{len(characters)} characters,", pretty_time(time_estimate)]
+        for scene, characters, takes, time_estimate in stat_lines
+    ] + [[""]*4 + [None]] + [
+        ["Total:", f"{takes} takes,", f"{len(characters)} characters,", pretty_time(time_estimate), None]
+        for scene, characters, takes, time_estimate in [stats[None]]
+    ]
+    max_lengths = [
+        max(len(cell) for cell in column)
+        for column in list(zip(*cells))
+    ]
+    lines = [
+        ' '.join([
+            f"{cell}{' '*padding}"
+            for cell, padding in zip(row, paddings)
+        ])
+        for row in cells
+        if (paddings := [
+            max_length - len(cell)
+            for max_length, cell in zip(max_lengths, row)
+        ]) is not None
+    ]
+
+    # interleave character lists
+    lines = [
+        line
+        for summary, lst in zip_longest(lines, character_sets)
+        for line in [summary] + list(typeset_items([capitalize(i) for i in (lst or set())], seperator=",  ", width=52, padding_left=3)) + [""]
+        if line is not None
+    ]
+
+    lines = [
+        "Scenes:",
+        "",
+    ] + lines
+
+    story.append(platypus.Preformatted('\n'.join(lines), style.default_style))
+
+    story.append(platypus.PageBreak())
+
 
 def pretty_time(delta):
     return str(delta).split('.', 2)[0]
@@ -139,12 +239,13 @@ def to_pdf(
     template_constructor=DocTemplate,
     settings=None
 ):
-    
     settings = settings or create_default_settings()
     story = get_title_page_story(screenplay, settings)
     has_title_page = bool(story)
 
-    add_character_stats(story, screenplay, settings)
+    stats = compile_stats(screenplay)
+    add_character_stats(story, stats, settings)
+    add_scene_stats(story, stats, settings)
 
     for para in screenplay:
         if isinstance(para, Dialog):
@@ -336,6 +437,36 @@ def main(args):
             output.close()
         if input_file:
             input.close()
+
+
+def typeset_items(items, seperator=' ', width=80, padding_left=0):
+    seplen = len(seperator.rstrip())
+    line = ""
+    last_item = None
+    for item in sorted(items):
+        if last_item is not None:
+            if (len(line) + len(last_item) + seplen)  >  (width - padding_left):
+                yield " "*padding_left + line.rstrip()
+                line = last_item + seperator
+            else:
+                line += last_item + seperator
+        last_item = item
+
+    if last_item:
+        if (len(line) + len(last_item) + seplen)  >  (width - padding_left):
+            yield " "*padding_left + line.rstrip()
+            line = last_item
+        else:
+            line += last_item
+
+    if line:
+        yield " "*padding_left + line.rstrip()
+
+def capitalize(string):
+    return " ".join([
+        item[:1].upper() + item[1:].lower()
+        for item in string.split(" ")
+    ])
 
 
 def cli():
