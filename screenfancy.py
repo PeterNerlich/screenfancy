@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/peter/screenplain/bin/python3
 
 # Adaption of screenplains main.py for custom pdf template and analytics
 # Copyright (c) 2011 Martin Vilcans
@@ -8,21 +8,41 @@
 import sys
 import re
 import codecs
+import math
 from optparse import OptionParser
 from reportlab import platypus
 from datetime import timedelta
 from pprint import pp
 from copy import deepcopy
 from itertools import zip_longest
+from collections import defaultdict
 
 from screenplain import types
 from screenplain.parsers import fountain
 from screenplain.main import output_formats, usage, invalid_format
-from screenplain.export.pdf import DocTemplate, create_default_settings, get_title_page_story, add_dialog, add_dual_dialog, add_paragraph, add_slug
+from screenplain.export.pdf import DocTemplate, create_default_settings, get_title_page_story, add_paragraph, Settings
 from screenplain.types import (
     Action, Dialog, DualDialog, Transition, Slug
 )
+from reportlab.lib import pagesizes
+from reportlab.platypus import Paragraph
 
+SLUG_COUNTER = 0
+DIALOG_COUNTER = 0
+
+STATS_STYLE = None
+STATS_LINE_WIDTH = None
+
+
+def produce_stat_lines(row, paddings):
+    line = ""
+    for i, [cell, padding] in enumerate(zip(row, paddings), start=1):
+        line += cell + " "*(padding+1) if i <= 1 else " "*(padding+1) + cell
+        if padding < 0:
+            yield line
+            line = " "*(sum(len(a)+b for a, b in zip(row[:i], paddings[:i])) + i)
+    if line:
+        yield line
 
 def compile_stats(screenplay):
     template = {
@@ -40,24 +60,35 @@ def compile_stats(screenplay):
         "characters": set(),
     }
 
-    characters = {}
-    characters[None] = total_characters = deepcopy(template_characters)
+    characters = defaultdict(lambda: deepcopy(template_characters))
+    total_characters = characters[None]
 
-    scenes = {}
-    scenes[None] = total_scenes = deepcopy(template_scenes)
+    scenes = defaultdict(lambda: deepcopy(template_scenes))
+    total_scenes = scenes[None]
+
+    # { "scene": {"character": {"other character": int(number of handoffs)}}}
+    handoffs = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 
     current_scene = None
     current_character = None
 
+    stat_slug_counter = 0
+
     def add_dialog(para):
+        nonlocal current_character
+        previous_character = current_character
         current_character = str(para.character).removesuffix(" (CONT'D)")
 
-        if current_character not in characters:
-            characters[current_character] = deepcopy(template_characters)
-        c = characters[current_character]
+        # handoffs
+        if current_character is not None and previous_character != current_character:
+            handoffs[current_scene][current_character][previous_character] += 1
+            handoffs[current_scene][previous_character][current_character] += 1
+            if current_scene is not None:
+                handoffs[None][current_character][previous_character] += 1
+                handoffs[None][previous_character][current_character] += 1
 
-        if current_scene not in scenes:
-            scenes[current_scene] = deepcopy(template_scenes)
+        # speaking parts
+        c = characters[current_character]
         s = scenes[current_scene]
 
         c["takes"] += 1
@@ -75,15 +106,19 @@ def compile_stats(screenplay):
                 c["words"] += len(words)
                 s["words"] += len(words)
         
-        total_characters["takes"] += 1
-        total_characters["scenes"].add(current_scene)
-        total_characters["words"] += c["words"]
-        total_characters["chars"] += c["chars"]
+        if current_character is not None:
+            # avoid double counting if there is no scene
+            total_characters["takes"] += 1
+            total_characters["scenes"].add(current_scene)
+            total_characters["words"] += c["words"]
+            total_characters["chars"] += c["chars"]
 
-        total_scenes["takes"] += 1
-        total_scenes["characters"].add(current_character)
-        total_scenes["words"] += s["words"]
-        total_scenes["chars"] += s["chars"]
+        if current_scene is not None:
+            # no clue if we could get a dialog without a character, but just to be sure
+            total_scenes["takes"] += 1
+            total_scenes["characters"].add(current_character)
+            total_scenes["words"] += s["words"]
+            total_scenes["chars"] += s["chars"]
 
     for para in screenplay:
         if isinstance(para, Dialog):
@@ -94,37 +129,34 @@ def compile_stats(screenplay):
         elif isinstance(para, Action):
             pass
         elif isinstance(para, Slug):
-            current_scene = ' '.join(str(l) for l in para.lines)
+            stat_slug_counter += 1
+            current_scene = f"{stat_slug_counter} - {' '.join(str(l) for l in para.lines)}"
         else:
             # Ignore unknown types
             pass
 
     for character, c in characters.items():
-        if character is not None:
-            c["time"] += timedelta(seconds = (
-                c["takes"] * 1
-              + c["words"] * .2
-              + c["chars"] * .025
-            ))
-            total_characters["time"] += c["time"]
+        c["time"] += timedelta(seconds = (
+            c["takes"] * 1
+          + c["words"] * .2
+          + c["chars"] * .025
+        ))
 
     for scene, s in scenes.items():
-        if scene is not None:
-            s["time"] += timedelta(seconds = (
-                s["takes"] * 1
-              + s["words"] * .2
-              + s["chars"] * .025
-            ))
-            total_scenes["time"] += s["time"]
+        s["time"] += timedelta(seconds = (
+            s["takes"] * 1
+          + s["words"] * .2
+          + s["chars"] * .025
+        ))
 
     return {
         "characters": characters,
         "scenes": scenes,
+        "handoffs": handoffs,
     }
 
 def add_character_stats(story, stat_dict, style):
     characters = stat_dict["characters"]
-    pp(characters)
     stats = {
         character: [character, len(stats["scenes"]), stats["takes"], stats["time"]]
         for character, stats in characters.items()
@@ -149,27 +181,29 @@ def add_character_stats(story, stat_dict, style):
         max(len(cell) for cell in column)
         for column in zip(*cells)
     ]
+    # fix first column such that line is at maximum
+    overshoot = (sum(max_lengths) + len(max_lengths) - 1) - STATS_LINE_WIDTH
+    if overshoot > 0:
+        max_lengths[0] -= overshoot
+
     lines = [
         "Characters:",
         "",
     ] + [
-        ' '.join([
-            f"{cell}{' '*padding}"
-            for cell, padding in zip(row, paddings)
-        ])
+        line
         for row in cells
         if (paddings := [
             max_length - len(cell)
             for max_length, cell in zip(max_lengths, row)
         ]) is not None
+        for line in produce_stat_lines(row, paddings)
     ]
-    story.append(platypus.Preformatted('\n'.join(lines), style.default_style))
+    story.append(platypus.Preformatted('\n'.join(lines), STATS_STYLE))
 
     story.append(platypus.PageBreak())
 
 def add_scene_stats(story, stat_dict, style):
     scenes = stat_dict["scenes"]
-    pp(scenes)
     stats = {
         scene: [scene, stats["characters"], stats["takes"], stats["time"]]
         for scene, stats in scenes.items()
@@ -180,7 +214,7 @@ def add_scene_stats(story, stat_dict, style):
         if scene is not None
     ]
     # Sort by speaking duration
-    stat_lines.sort(key=lambda x: x[3], reverse=True)
+    #stat_lines.sort(key=lambda x: x[3], reverse=True)
 
     # Prepare per scene character list
     character_sets = [
@@ -192,19 +226,21 @@ def add_scene_stats(story, stat_dict, style):
     cells = [
         [f"{scene}:", f"{takes} takes,", f"{len(characters)} characters,", pretty_time(time_estimate)]
         for scene, characters, takes, time_estimate in stat_lines
-    ] + [[""]*4 + [None]] + [
-        ["Total:", f"{takes} takes,", f"{len(characters)} characters,", pretty_time(time_estimate), None]
+    ] + [[""]*4] + [
+        ["Total:", f"{takes} takes,", f"{len(characters)} characters,", pretty_time(time_estimate)]
         for scene, characters, takes, time_estimate in [stats[None]]
     ]
     max_lengths = [
         max(len(cell) for cell in column)
         for column in list(zip(*cells))
     ]
+    # fix first column such that line is at maximum
+    overshoot = (sum(max_lengths) + len(max_lengths) - 1) - STATS_LINE_WIDTH
+    if overshoot > 0:
+        max_lengths[0] -= overshoot
+
     lines = [
-        ' '.join([
-            f"{cell}{' '*padding}"
-            for cell, padding in zip(row, paddings)
-        ])
+        produce_stat_lines(row, paddings)
         for row in cells
         if (paddings := [
             max_length - len(cell)
@@ -212,11 +248,11 @@ def add_scene_stats(story, stat_dict, style):
         ]) is not None
     ]
 
-    # interleave character lists
+    # interleave character lists and flatten stat lines
     lines = [
         line
         for summary, lst in zip_longest(lines, character_sets)
-        for line in [summary] + list(typeset_items([capitalize(i) for i in (lst or set())], seperator=",  ", width=52, padding_left=3)) + [""]
+        for line in list(summary) + list(typeset_items([capitalize(i) for i in (lst or set())], seperator=",  ", width=STATS_LINE_WIDTH, padding_left=3)) + [""]
         if line is not None
     ]
 
@@ -225,9 +261,107 @@ def add_scene_stats(story, stat_dict, style):
         "",
     ] + lines
 
-    story.append(platypus.Preformatted('\n'.join(lines), style.default_style))
+    story.append(platypus.Preformatted('\n'.join(lines), STATS_STYLE))
 
     story.append(platypus.PageBreak())
+
+
+def add_handoff_stats(story, stat_dict, style):
+    handoffs = stat_dict["handoffs"]
+
+    cells = []
+
+    def format_handoffs_for_scene(scene, characters, scene_total):
+        cells.append([scene, f"{scene_total} ", ""])
+
+        annotated_character_total = [[a, others, sum(others.values())] for a, others in characters.items()]
+        for a, others, for_a in sorted(annotated_character_total, key=lambda item: item[2], reverse=True):
+            if a is None:
+                continue
+            cells.append([f"{' '*4}{a}", f"({for_a})", ""])
+            for b, times in sorted(others.items(), key=lambda item: item[1], reverse=True):
+                if b is None:
+                    continue
+                percent = round(times / for_a * 100)
+                cells.append([f"{' '*8}{capitalize(b)}:", f"{times} ", f"{percent}%"])
+
+    annotated_scene_total = [
+        [scene, characters, sum([
+            i
+            for interactions in characters.values()
+            for i in interactions.values()
+        ])]
+        for scene, characters in handoffs.items()
+    ]
+    #for scene, characters, scene_total in sorted(annotated_scene_total, key=lambda item: item[2], reverse=True):
+    for scene, characters, scene_total in annotated_scene_total:
+        if scene is not None:
+            if cells:
+                cells.append([""]*3)
+            format_handoffs_for_scene(scene, characters, scene_total)
+
+    cells.append([""]*3)
+
+    format_handoffs_for_scene("Total:", handoffs[None], sum([scene_total for _, _, scene_total in annotated_scene_total]))
+
+    max_lengths = [
+        max(len(cell) for cell in column)
+        for column in zip(*cells)
+    ]
+    # fix first column such that line is at maximum
+    overshoot = (sum(max_lengths) + len(max_lengths) - 1) - STATS_LINE_WIDTH
+    if overshoot > 0:
+        max_lengths[0] -= overshoot
+
+    lines = [
+        ' '.join([
+            f"{cell}{' '*padding}" if i == 0 else f"{' '*padding}{cell}"
+            for i, [cell, padding] in enumerate(zip(row, paddings))
+        ])
+        for row in cells
+        if (paddings := [
+            max_length - len(cell)
+            for max_length, cell in zip(max_lengths, row)
+        ]) is not None
+    ]
+
+    lines = [
+        "Handoffs:",
+        "",
+    ] + lines
+
+    story.append(platypus.Preformatted('\n'.join(lines), STATS_STYLE))
+
+    story.append(platypus.PageBreak())
+
+
+def add_slug(story, para, style, is_strong):
+    global SLUG_COUNTER
+    SLUG_COUNTER += 1
+    html = f"<b>{SLUG_COUNTER} - {' '.join(l.to_html() for l in para.lines)}</b>"
+    story.append(Paragraph(html, style))
+
+
+def add_dialog(story, dialog, settings):
+    global DIALOG_COUNTER
+    DIALOG_COUNTER += 1
+    story.append(
+        Paragraph(f"{DIALOG_COUNTER} - {dialog.character.to_html()}", settings.character_style)
+    )
+    for parenthetical, line in dialog.blocks:
+        if parenthetical:
+            story.append(
+                Paragraph(line.to_html(), settings.parenthentical_style)
+            )
+        else:
+            story.append(
+                Paragraph(line.to_html(), settings.dialog_style)
+            )
+
+
+def add_dual_dialog(story, dual, settings):
+    add_dialog(story, dual.left, settings)
+    add_dialog(story, dual.right, settings)
 
 
 def pretty_time(delta):
@@ -242,6 +376,14 @@ def to_pdf(
     settings = settings or create_default_settings()
     story = get_title_page_story(screenplay, settings)
     has_title_page = bool(story)
+    global STATS_STYLE
+    STATS_STYLE = deepcopy(settings.default_style)
+    STATS_STYLE.name = "stats"
+    STATS_STYLE.fontSize *= .8
+    p = Paragraph("X"*math.floor(settings.frame_width), STATS_STYLE)
+    p.wrap(settings.frame_width, settings.frame_height)
+    global STATS_LINE_WIDTH
+    STATS_LINE_WIDTH = len(p.blPara.lines[0][1][0])
 
     stats = compile_stats(screenplay)
     add_character_stats(story, stats, settings)
@@ -268,6 +410,10 @@ def to_pdf(
         else:
             # Ignore unknown types
             pass
+
+    story.append(platypus.PageBreak())
+    story.append(platypus.PageBreak())
+    add_handoff_stats(story, stats, settings)
 
     meta = pdf_metadata(screenplay)
     doc = template_constructor(
@@ -428,9 +574,10 @@ def main(args):
                 css_file=options.css, bare=options.bare
             )
         elif format == 'pdf':
-            settings = create_default_settings()
+            settings = Settings(page_size=pagesizes.A4)
             settings.character_style.fontName += "-Bold"
             settings.strong_slugs = options.strong
+            settings
             to_pdf(screenplay, output, template_constructor=DocTemplate, settings=settings)
     finally:
         if output_file:
@@ -463,6 +610,8 @@ def typeset_items(items, seperator=' ', width=80, padding_left=0):
         yield " "*padding_left + line.rstrip()
 
 def capitalize(string):
+    if string is None:
+        return None
     return " ".join([
         item[:1].upper() + item[1:].lower()
         for item in string.split(" ")
